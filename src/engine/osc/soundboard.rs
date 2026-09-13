@@ -1,0 +1,185 @@
+use super::modal::ModalOscillator;
+use crate::engine::math::{rng::DeterministicRandom, vector::Vector3};
+use std::f64::consts::PI;
+
+pub struct SoundboardDesign {
+    pub mode_count: usize,
+    pub lowest_mode_frequency: f64,
+    pub highest_mode_frequency: f64,
+    pub random_seed: u64,
+}
+
+pub struct BridgeState {
+    pub displacement: Vector3,
+    pub acceleration: Vector3,
+}
+
+pub struct Soundboard {
+    pub modes: Vec<ModalOscillator>,
+    pub vertical_bridge_coupling: Vec<f64>,
+    pub horizontal_bridge_coupling: Vec<f64>,
+    pub longitudinal_bridge_coupling: Vec<f64>,
+    pub volume_displacement_coupling: Vec<f64>,
+    last_applied_modal_forces: Vec<f64>,
+}
+
+impl Soundboard {
+    pub fn new(design: &SoundboardDesign) -> Self {
+        let mut random = DeterministicRandom::new(design.random_seed);
+        let mode_count = design.mode_count.max(1);
+
+        let mut modes = Vec::with_capacity(mode_count);
+        let mut vertical_bridge_coupling = Vec::with_capacity(mode_count);
+        let mut horizontal_bridge_coupling = Vec::with_capacity(mode_count);
+        let mut longitudinal_bridge_coupling = Vec::with_capacity(mode_count);
+        let mut volume_displacement_coupling = Vec::with_capacity(mode_count);
+        let mut last_applied_modal_forces = vec![0.0; mode_count];
+
+        for mode_index in 0..mode_count {
+            let frequency = design.lowest_mode_frequency
+                + (mode_index as f64 + random.unit_interval())
+                    * (design.highest_mode_frequency - design.lowest_mode_frequency)
+                    / mode_count as f64;
+
+            let angular_frequency = 2.0 * PI * frequency;
+            let damping_ratio = random.uniform(0.02, 0.06) * (1.0 + frequency / 2500.0);
+            let modal_mass = random.uniform(0.3, 1.2);
+
+            modes.push(ModalOscillator::new(
+                angular_frequency,
+                damping_ratio,
+                modal_mass,
+            ));
+
+            let low_frequency_weight = (-frequency / 700.0).exp();
+
+            vertical_bridge_coupling.push(
+                random.random_sign()
+                    * (0.10 + 0.80 * low_frequency_weight * random.unit_interval()),
+            );
+
+            horizontal_bridge_coupling.push(
+                random.random_sign()
+                    * (0.04 + 0.30 * low_frequency_weight * random.unit_interval()),
+            );
+
+            longitudinal_bridge_coupling.push(
+                random.random_sign()
+                    * (0.01 + 0.05 * low_frequency_weight * random.unit_interval()),
+            );
+
+            volume_displacement_coupling.push(
+                random.random_sign()
+                    * (0.02 + 0.30 * (-frequency / 500.0).exp() * random.unit_interval()),
+            );
+        }
+
+        Soundboard {
+            modes,
+            vertical_bridge_coupling,
+            horizontal_bridge_coupling,
+            longitudinal_bridge_coupling,
+            volume_displacement_coupling,
+            last_applied_modal_forces,
+        }
+    }
+
+    #[inline]
+    pub fn apply_forces_and_advance(
+        &mut self,
+        total_bridge_force_from_strings: Vector3,
+        air_pressure_at_board: f64,
+        step_size: f64,
+    ) {
+        let force_x = total_bridge_force_from_strings.x;
+        let force_y = total_bridge_force_from_strings.y;
+        let force_z = total_bridge_force_from_strings.z;
+
+        for mode_index in 0..self.modes.len() {
+            let modal_force = self.vertical_bridge_coupling[mode_index] * force_z
+                + self.horizontal_bridge_coupling[mode_index] * force_y
+                + self.longitudinal_bridge_coupling[mode_index] * force_x
+                - self.volume_displacement_coupling[mode_index] * air_pressure_at_board;
+
+            self.last_applied_modal_forces[mode_index] = modal_force;
+            self.modes[mode_index].advance(modal_force, step_size);
+        }
+    }
+
+    pub fn bridge_state(&self) -> BridgeState {
+        let mut displacement = Vector3::ZERO;
+        let mut acceleration = Vector3::ZERO;
+
+        for mode_index in 0..self.modes.len() {
+            let modal_displacement = self.modes[mode_index].displacement;
+            let modal_acceleration = self.modes[mode_index]
+                .acceleration_for_force(self.last_applied_modal_forces[mode_index]);
+
+            let longitudinal_coupling = self.longitudinal_bridge_coupling[mode_index];
+            let horizontal_coupling = self.horizontal_bridge_coupling[mode_index];
+            let vertical_coupling = self.vertical_bridge_coupling[mode_index];
+
+            displacement.x += longitudinal_coupling * modal_displacement;
+            acceleration.x += longitudinal_coupling * modal_acceleration;
+
+            displacement.y += horizontal_coupling * modal_displacement;
+            acceleration.y += horizontal_coupling * modal_acceleration;
+
+            displacement.z += vertical_coupling * modal_displacement;
+            acceleration.z += vertical_coupling * modal_acceleration;
+        }
+
+        BridgeState {
+            displacement,
+            acceleration,
+        }
+    }
+
+    pub fn bridge_displacement(&self) -> Vector3 {
+        let mut displacement = Vector3::ZERO;
+
+        for mode_index in 0..self.modes.len() {
+            let modal_displacement = self.modes[mode_index].displacement;
+
+            displacement.x += self.longitudinal_bridge_coupling[mode_index] * modal_displacement;
+            displacement.y += self.horizontal_bridge_coupling[mode_index] * modal_displacement;
+            displacement.z += self.vertical_bridge_coupling[mode_index] * modal_displacement;
+        }
+
+        displacement
+    }
+
+    pub fn volume_velocity(&self) -> f64 {
+        let mut total_volume_velocity = 0.0;
+
+        for mode_index in 0..self.modes.len() {
+            total_volume_velocity +=
+                self.volume_displacement_coupling[mode_index] * self.modes[mode_index].velocity;
+        }
+
+        total_volume_velocity
+    }
+
+    pub fn volume_acceleration(&self) -> f64 {
+        let mut total_volume_acceleration = 0.0;
+
+        for mode_index in 0..self.modes.len() {
+            let modal_acceleration = self.modes[mode_index]
+                .acceleration_for_force(self.last_applied_modal_forces[mode_index]);
+
+            total_volume_acceleration +=
+                self.volume_displacement_coupling[mode_index] * modal_acceleration;
+        }
+
+        total_volume_acceleration
+    }
+
+    pub fn reset(&mut self) {
+        for mode in &mut self.modes {
+            mode.displacement = 0.0;
+            mode.velocity = 0.0;
+        }
+
+        self.last_applied_modal_forces.fill(0.0);
+    }
+}
